@@ -290,34 +290,55 @@ $changedFiles = @()
 $ConfigDir = (Resolve-Path $ConfigDir).Path.TrimEnd('\')
 $configDirNormalized = $ConfigDir.Replace('\', '/')
 
+# core.quotePath=false: with the git default a path with non-ASCII characters comes back
+# quoted and octal-escaped, Test-Path does not find it and the object silently drops out
+# of the load list. The output is decoded as UTF-8 explicitly through Process: the console
+# code page is not involved, and a process without a console (CI runner) decodes the same way.
+function Invoke-GitLines {
+    param([string[]]$GitArgs)
+    $quoted = @('-c', 'core.quotePath=false') + $GitArgs | ForEach-Object {
+        if ($_ -match '[\s"]') { '"' + ($_ -replace '"', '\"') + '"' } else { $_ }
+    }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'git'
+    $psi.Arguments = $quoted -join ' '
+    $psi.WorkingDirectory = (Get-Location).Path
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+    $psi.CreateNoWindow = $true
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        return @()
+    }
+    $out = $proc.StandardOutput.ReadToEnd()
+    $proc.WaitForExit()
+    if ($proc.ExitCode -ne 0) { return @() }
+    return @($out -split "`r?`n" | Where-Object { $_ -ne '' })
+}
+
 Push-Location $ConfigDir
 try {
     switch ($Source) {
         "Staged" {
             Write-Host "Getting staged changes..."
-            $raw = git diff --cached --name-only --relative 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
+            $changedFiles += Invoke-GitLines @("diff", "--cached", "--name-only", "--relative")
         }
         "Unstaged" {
             Write-Host "Getting unstaged changes..."
-            $raw = git diff --name-only --relative 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
-            $raw = git ls-files --others --exclude-standard 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
+            $changedFiles += Invoke-GitLines @("diff", "--name-only", "--relative")
+            $changedFiles += Invoke-GitLines @("ls-files", "--others", "--exclude-standard")
         }
         "Commit" {
             Write-Host "Getting changes from $CommitRange..."
-            $raw = git diff --name-only --relative $CommitRange 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
+            $changedFiles += Invoke-GitLines @("diff", "--name-only", "--relative", $CommitRange)
         }
         "All" {
             Write-Host "Getting all uncommitted changes..."
-            $raw = git diff --cached --name-only --relative 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
-            $raw = git diff --name-only --relative 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
-            $raw = git ls-files --others --exclude-standard 2>&1
-            if ($LASTEXITCODE -eq 0) { $changedFiles += $raw }
+            $changedFiles += Invoke-GitLines @("diff", "--cached", "--name-only", "--relative")
+            $changedFiles += Invoke-GitLines @("diff", "--name-only", "--relative")
+            $changedFiles += Invoke-GitLines @("ls-files", "--others", "--exclude-standard")
         }
     }
 } finally {
@@ -371,8 +392,14 @@ foreach ($file in $changedFiles) {
                 if ($parts.Count -ge 2) {
                     $extDir = Join-Path (Join-Path $ConfigDir $parts[0]) "$($parts[1])\Ext"
                     if (Test-Path $extDir) {
+                        # The relative path is rebuilt from the object parts and the part inside Ext:
+                        # FullName is canonical (long form), while $ConfigDir keeps the spelling it was
+                        # given, for example a short 8.3 name of the temp folder, so prefix replacement
+                        # does not strip it and the absolute path would stay in the list.
+                        $extDirFull = (Get-Item -LiteralPath $extDir).FullName
                         Get-ChildItem -Path $extDir -Recurse -File | ForEach-Object {
-                            $extRelPath = $_.FullName.Replace("$ConfigDir\", '').Replace('\', '/')
+                            $inside = $_.FullName.Substring($extDirFull.Length).TrimStart('\', '/').Replace('\', '/')
+                            $extRelPath = "$($parts[0])/$($parts[1])/Ext/$inside"
                             if ($configFiles -notcontains $extRelPath) {
                                 $configFiles += $extRelPath
                             }
